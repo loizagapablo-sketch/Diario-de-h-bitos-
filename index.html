@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#12141A" />
+<title>Diario de Misiones</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Diario de Misiones" />
+<style>
+  html, body { margin: 0; padding: 0; background: #12141A; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // Local, on-device storage shim with the same shape as the Claude artifact
+  // storage API (get/set/delete/list), so the app code works unchanged.
+  window.storage = {
+    async get(key) {
+      const v = localStorage.getItem(key);
+      if (v === null) throw new Error("not found: " + key);
+      return { key, value: v, shared: false };
+    },
+    async set(key, value) {
+      localStorage.setItem(key, value);
+      return { key, value, shared: false };
+    },
+    async delete(key) {
+      localStorage.removeItem(key);
+      return { key, deleted: true, shared: false };
+    },
+    async list(prefix) {
+      const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+      return { keys, prefix, shared: false };
+    },
+  };
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+
+// ---------- helpers ----------
+const todayKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const CATEGORIES = [
+  { id: "espiritual", name: "Vida espiritual", icon: "☀️" },
+  { id: "familia", name: "Familia", icon: "🏠" },
+  { id: "salud", name: "Salud", icon: "🏋️" },
+  { id: "estudios", name: "Estudios/Carrera Profesional", icon: "📖" },
+  { id: "social", name: "Social", icon: "💬" },
+  { id: "creatividad", name: "Creatividad", icon: "💡" },
+  { id: "finanzas", name: "Finanzas", icon: "💰" },
+  { id: "amorosa", name: "Relación Amorosa", icon: "💗" },
+];
+
+const DEFAULT_HABITS = [
+  { id: "h1", name: "Entrenar", points: 20, type: "instant", category: "salud", kind: "good", hpImpact: 15 },
+  { id: "h4", name: "Hacer la cama", points: 10, type: "instant", category: "familia", kind: "good", hpImpact: 10 },
+  { id: "h2", name: "Comer sano", points: 15, type: "daily", category: "salud", kind: "good", hpImpact: 10 },
+  { id: "h3", name: "Ahorrar", points: 15, type: "daily", category: "finanzas", kind: "good", hpImpact: 10 },
+];
+
+const LEVEL_STEP = 100;
+const LONG_PRESS_MS = 380;
+const MOVE_CANCEL_PX = 12;
+const MAX_HP = 1000;
+
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+
+// escalating XP requirement per category level, mirrors a life-areas leveling feel
+function levelInfo(xp) {
+  let level = 1;
+  let need = 200;
+  let rem = xp;
+  while (rem >= need) {
+    rem -= need;
+    level++;
+    need = 200 + (level - 1) * 100;
+  }
+  return { level, into: rem, need };
+}
+
+function HabitQuest() {
+  const [page, setPage] = useState("quests"); // 'quests' | 'categories'
+  const [habits, setHabits] = useState(null);
+  const [completions, setCompletions] = useState(null);
+  const [characterHP, setCharacterHP] = useState(null);
+  const [runsCompleted, setRunsCompleted] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+
+  const [showAdd, setShowAdd] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newPoints, setNewPoints] = useState(10);
+  const [newType, setNewType] = useState("instant");
+  const [newKind, setNewKind] = useState("good");
+  const [newCategory, setNewCategory] = useState(CATEGORIES[0].id);
+  const [newHpImpact, setNewHpImpact] = useState(10);
+
+  const [justStamped, setJustStamped] = useState(null);
+  const [error, setError] = useState("");
+  const [dragging, setDragging] = useState(null);
+
+  const pressRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const [importMsg, setImportMsg] = useState("");
+  const today = todayKey();
+
+  // ---------- load ----------
+  useEffect(() => {
+    async function safeGet(key, fallback) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await window.storage.get(key);
+          return JSON.parse(res.value);
+        } catch {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 300));
+            continue;
+          }
+          return fallback;
+        }
+      }
+      return fallback;
+    }
+
+    (async () => {
+      const h = await safeGet("habits", DEFAULT_HABITS);
+      const c = await safeGet("completions", {});
+      const hp = await safeGet("characterHP", MAX_HP);
+      const runs = await safeGet("runsCompleted", 0);
+
+      setHabits(
+        (Array.isArray(h) ? h : DEFAULT_HABITS).map((x) => ({
+          ...x,
+          type: x.type === "instant" ? "instant" : "daily",
+          kind: x.kind === "bad" ? "bad" : "good",
+          category: x.category || CATEGORIES[0].id,
+          hpImpact: typeof x.hpImpact === "number" ? x.hpImpact : 10,
+        }))
+      );
+      setCompletions(c && typeof c === "object" ? c : {});
+      setCharacterHP(typeof hp === "number" && !Number.isNaN(hp) ? clamp(hp, 0, MAX_HP) : MAX_HP);
+      setRunsCompleted(typeof runs === "number" ? runs : 0);
+      setLoaded(true);
+    })();
+  }, []);
+
+  const persistHabits = useCallback(async (h) => {
+    setHabits(h);
+    try {
+      await window.storage.set("habits", JSON.stringify(h));
+    } catch {
+      setError("No se pudo guardar el cambio. Revisa tu conexión.");
+    }
+  }, []);
+
+  const persistCompletions = useCallback(async (c) => {
+    setCompletions(c);
+    try {
+      await window.storage.set("completions", JSON.stringify(c));
+    } catch {
+      setError("No se pudo guardar el cambio. Revisa tu conexión.");
+    }
+  }, []);
+
+  const persistHP = useCallback(async (hp) => {
+    setCharacterHP(hp);
+    try {
+      await window.storage.set("characterHP", JSON.stringify(hp));
+    } catch {
+      setError("No se pudo guardar tu vida. Revisa tu conexión.");
+    }
+  }, []);
+
+  const persistRuns = useCallback(async (n) => {
+    setRunsCompleted(n);
+    try {
+      await window.storage.set("runsCompleted", JSON.stringify(n));
+    } catch {
+      /* non-critical */
+    }
+  }, []);
+
+  const changeHabitType = useCallback((habitId, newTypeVal) => {
+    setHabits((prev) => {
+      const next = prev.map((h) => (h.id === habitId ? { ...h, type: newTypeVal } : h));
+      window.storage.set("habits", JSON.stringify(next)).catch(() => {
+        setError("No se pudo guardar el cambio. Revisa tu conexión.");
+      });
+      return next;
+    });
+  }, []);
+
+  // ---------- drag & drop (press and hold) ----------
+  useEffect(() => {
+    function onMove(e) {
+      const p = pressRef.current;
+      if (!p) return;
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      if (!p.dragging) {
+        const dist = Math.hypot(clientX - p.startX, clientY - p.startY);
+        if (dist > MOVE_CANCEL_PX) {
+          clearTimeout(p.timerId);
+          pressRef.current = null;
+        }
+        return;
+      }
+      if (e.cancelable) e.preventDefault();
+      let hoverType = null;
+      const el = document.elementFromPoint(clientX, clientY);
+      const sectionEl = el && el.closest ? el.closest("[data-section-type]") : null;
+      if (sectionEl) hoverType = sectionEl.getAttribute("data-section-type");
+      p.x = clientX;
+      p.y = clientY;
+      p.hoverType = hoverType;
+      setDragging({ habitId: p.habitId, x: clientX, y: clientY, hoverType, originType: p.originType });
+    }
+    function onUp() {
+      const p = pressRef.current;
+      if (!p) return;
+      if (p.dragging) {
+        if (p.hoverType && p.hoverType !== p.originType) {
+          changeHabitType(p.habitId, p.hoverType);
+        }
+      } else {
+        clearTimeout(p.timerId);
+      }
+      pressRef.current = null;
+      setDragging(null);
+    }
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [changeHabitType]);
+
+  const handleCardPointerDown = (e, habit) => {
+    if (e.button !== 0 && e.button !== undefined) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const timerId = setTimeout(() => {
+      if (pressRef.current) {
+        pressRef.current.dragging = true;
+        if (navigator.vibrate) navigator.vibrate(15);
+        setDragging({
+          habitId: habit.id,
+          x: startX,
+          y: startY,
+          hoverType: habit.type,
+          originType: habit.type,
+        });
+      }
+    }, LONG_PRESS_MS);
+    pressRef.current = {
+      habitId: habit.id,
+      startX,
+      startY,
+      timerId,
+      dragging: false,
+      hoverType: habit.type,
+      originType: habit.type,
+    };
+  };
+
+  if (!loaded || !habits || !completions || characterHP === null) {
+    return (
+      <div style={styles.loadingWrap}>
+        <FontsAndKeyframes />
+        <div style={styles.loadingRune}>◆</div>
+        <div style={{ fontFamily: "'Inter', sans-serif", color: "#8B8F9B", marginTop: 12 }}>
+          Cargando tu diario de misiones…
+        </div>
+      </div>
+    );
+  }
+
+  const todaysCompletions = completions[today] || {};
+
+  const toggleHabit = (habitId) => {
+    const habit = habits.find((h) => h.id === habitId);
+    if (!habit) return;
+    const dayMap = { ...(completions[today] || {}) };
+    const wasDone = !!dayMap[habitId];
+    let hpDelta = 0;
+    if (wasDone) {
+      delete dayMap[habitId];
+      hpDelta = habit.kind === "bad" ? habit.hpImpact : -habit.hpImpact;
+    } else {
+      dayMap[habitId] = true;
+      setJustStamped(habitId);
+      setTimeout(() => setJustStamped(null), 550);
+      hpDelta = habit.kind === "bad" ? -habit.hpImpact : habit.hpImpact;
+    }
+    const nextCompletions = { ...completions, [today]: dayMap };
+    persistCompletions(nextCompletions);
+    persistHP(clamp(characterHP + hpDelta, 0, MAX_HP));
+  };
+
+  const addHabit = () => {
+    const name = newName.trim();
+    const pts = Math.max(0, Math.min(999, Number(newPoints) || 0));
+    const hpImp = Math.max(1, Math.min(500, Number(newHpImpact) || 1));
+    if (!name) {
+      setError("Ponle un nombre a la misión antes de añadirla.");
+      return;
+    }
+    const id = "h" + Date.now();
+    const next = [
+      ...habits,
+      {
+        id,
+        name,
+        points: newKind === "bad" ? 0 : pts,
+        type: newType,
+        category: newCategory,
+        kind: newKind,
+        hpImpact: hpImp,
+      },
+    ];
+    persistHabits(next);
+    setNewName("");
+    setNewPoints(10);
+    setNewType("instant");
+    setNewKind("good");
+    setNewCategory(CATEGORIES[0].id);
+    setNewHpImpact(10);
+    setShowAdd(false);
+    setError("");
+  };
+
+  const removeHabit = (id) => {
+    persistHabits(habits.filter((h) => h.id !== id));
+  };
+
+  const handleRunDone = () => {
+    persistHP(MAX_HP);
+    persistRuns(runsCompleted + 1);
+  };
+
+  const exportData = () => {
+    try {
+      const backup = {
+        habits,
+        completions,
+        characterHP,
+        runsCompleted,
+        exportedAt: new Date().toISOString(),
+      };
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `diario-de-misiones-${today}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setImportMsg("Copia de seguridad descargada.");
+      setTimeout(() => setImportMsg(""), 3000);
+    } catch {
+      setError("No se pudo exportar la copia de seguridad.");
+    }
+  };
+
+  const triggerImport = () => {
+    if (fileInputRef.current) fileInputRef.current.click();
+  };
+
+  const handleImportFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!Array.isArray(data.habits) || typeof data.completions !== "object") {
+          throw new Error("Formato inválido");
+        }
+        const cleanHabits = data.habits.map((x) => ({
+          ...x,
+          type: x.type === "instant" ? "instant" : "daily",
+          kind: x.kind === "bad" ? "bad" : "good",
+          category: x.category || CATEGORIES[0].id,
+          hpImpact: typeof x.hpImpact === "number" ? x.hpImpact : 10,
+        }));
+        const cleanHP =
+          typeof data.characterHP === "number" ? clamp(data.characterHP, 0, MAX_HP) : MAX_HP;
+        const cleanRuns = typeof data.runsCompleted === "number" ? data.runsCompleted : 0;
+        persistHabits(cleanHabits);
+        persistCompletions(data.completions);
+        persistHP(cleanHP);
+        persistRuns(cleanRuns);
+        setImportMsg("Datos restaurados correctamente.");
+        setTimeout(() => setImportMsg(""), 3000);
+      } catch {
+        setError("Ese archivo no parece una copia de seguridad válida.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  // total XP (only good habits count toward level/XP)
+  const totalXP = Object.values(completions).reduce((sum, dayMap) => {
+    return (
+      sum +
+      Object.keys(dayMap).reduce((s, hid) => {
+        const habit = habits.find((h) => h.id === hid);
+        if (!habit || habit.kind === "bad") return s;
+        return s + habit.points;
+      }, 0)
+    );
+  }, 0);
+
+  const level = Math.floor(totalXP / LEVEL_STEP) + 1;
+  const xpIntoLevel = totalXP % LEVEL_STEP;
+  const xpPct = Math.round((xpIntoLevel / LEVEL_STEP) * 100);
+
+  const todayEarned = habits.reduce(
+    (s, h) => s + (h.kind !== "bad" && todaysCompletions[h.id] ? h.points : 0),
+    0
+  );
+  const todayPossible = habits.reduce((s, h) => (h.kind !== "bad" ? s + h.points : s), 0);
+  const trackableHabits = habits.filter((h) => true);
+  const allDoneToday =
+    trackableHabits.length > 0 && trackableHabits.every((h) => todaysCompletions[h.id]);
+
+  const instantHabits = habits.filter((h) => h.type === "instant");
+  const dailyHabits = habits.filter((h) => h.type !== "instant");
+
+  const draggedHabit = dragging ? habits.find((h) => h.id === dragging.habitId) : null;
+  const hpPct = Math.round((characterHP / MAX_HP) * 100);
+
+  const categoryXP = (catId) => {
+    let sum = 0;
+    Object.values(completions).forEach((dayMap) => {
+      Object.keys(dayMap).forEach((hid) => {
+        const h = habits.find((x) => x.id === hid);
+        if (h && h.kind !== "bad" && h.category === catId) sum += h.points;
+      });
+    });
+    return sum;
+  };
+
+  return (
+    <div style={styles.page}>
+      <FontsAndKeyframes />
+      <div style={styles.container}>
+        {/* Header */}
+        <header style={styles.header}>
+          <div style={styles.headerTop}>
+            <div>
+              <div style={styles.eyebrow}>DIARIO DE MISIONES</div>
+              <h1 style={styles.title}>Tus hábitos, tu leyenda</h1>
+            </div>
+            <div style={styles.levelBadge}>
+              <div style={styles.levelBadgeInner}>
+                <div style={styles.levelNum}>{level}</div>
+                <div style={styles.levelLabel}>NIVEL</div>
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.xpBarOuter} aria-label={`${xpIntoLevel} de ${LEVEL_STEP} XP hacia el nivel ${level + 1}`}>
+            <div style={{ ...styles.xpBarFill, width: `${xpPct}%` }} />
+            <div style={styles.xpBarNotches}>
+              {Array.from({ length: 10 }).map((_, i) => (
+                <div key={i} style={styles.notch} />
+              ))}
+            </div>
+          </div>
+          <div style={styles.xpBarCaption}>
+            <span style={styles.mono}>{xpIntoLevel} / {LEVEL_STEP} XP</span>
+            <span style={styles.mono}>Total: {totalXP} XP</span>
+          </div>
+
+          <div style={styles.hpRow}>
+            <span style={styles.hpIcon}>❤</span>
+            <div style={styles.hpBarOuter}>
+              <div
+                style={{
+                  ...styles.hpBarFill,
+                  width: `${hpPct}%`,
+                  background:
+                    hpPct > 50
+                      ? "linear-gradient(90deg,#7a1f2b,#E8607A)"
+                      : hpPct > 20
+                      ? "linear-gradient(90deg,#7a4a1f,#E8A83C)"
+                      : "linear-gradient(90deg,#5a0f14,#E8607A)",
+                }}
+              />
+            </div>
+            <span style={styles.hpText}>{characterHP} / {MAX_HP}</span>
+          </div>
+        </header>
+
+        {characterHP <= 0 && (
+          <div style={styles.hpBanner}>
+            <div style={styles.hpBannerTitle}>💀 Te has quedado sin vida</div>
+            <div style={styles.hpBannerText}>
+              Tu penitencia: corre 5 km. Cuando lo hayas hecho, pulsa el botón para recuperar tu vida al completo.
+            </div>
+            <button style={styles.hpBannerBtn} onClick={handleRunDone}>
+              Ya corrí mis 5 km
+            </button>
+          </div>
+        )}
+
+        {/* Nav tabs */}
+        <div style={styles.tabs}>
+          <button
+            style={{ ...styles.tab, ...(page === "quests" ? styles.tabActive : {}) }}
+            onClick={() => setPage("quests")}
+          >
+            🗺️ Misiones
+          </button>
+          <button
+            style={{ ...styles.tab, ...(page === "categories" ? styles.tabActive : {}) }}
+            onClick={() => setPage("categories")}
+          >
+            📊 Áreas de vida
+          </button>
+        </div>
+
+        {error && (
+          <div style={styles.errorBox} role="alert">
+            {error}
+            <button style={styles.errorDismiss} onClick={() => setError("")}>✕</button>
+          </div>
+        )}
+
+        {page === "quests" && (
+          <>
+            {/* Today status */}
+            <div style={{ ...styles.todayCard, ...(allDoneToday ? styles.todayCardDone : {}) }}>
+              <div>
+                <div style={styles.todayLabel}>HOY</div>
+                <div style={styles.todayValue}>
+                  {todayEarned} <span style={styles.todayOf}>/ {todayPossible} XP</span>
+                </div>
+              </div>
+              {allDoneToday && <div style={styles.doneBanner}>✦ Jornada completa ✦</div>}
+            </div>
+
+            <div style={styles.dragHint}>
+              Mantén el dedo sobre una misión y arrástrala para cambiarla de sección.
+            </div>
+
+            <Section
+              title="Instantáneas"
+              icon="⚡"
+              hint="Se completan al momento"
+              sectionType="instant"
+              habits={instantHabits}
+              todaysCompletions={todaysCompletions}
+              dragging={dragging}
+              onToggle={toggleHabit}
+              onRemove={removeHabit}
+              onCardPointerDown={handleCardPointerDown}
+              justStamped={justStamped}
+            />
+
+            <Section
+              title="Al final del día"
+              icon="🌙"
+              hint="Se valoran al cierre del día"
+              sectionType="daily"
+              habits={dailyHabits}
+              todaysCompletions={todaysCompletions}
+              dragging={dragging}
+              onToggle={toggleHabit}
+              onRemove={removeHabit}
+              onCardPointerDown={handleCardPointerDown}
+              justStamped={justStamped}
+            />
+
+            {!showAdd ? (
+              <button style={styles.addBtn} onClick={() => setShowAdd(true)}>
+                + Nueva misión
+              </button>
+            ) : (
+              <div style={styles.addForm}>
+                <div style={styles.addFormTitle}>Nueva misión</div>
+                <input
+                  style={styles.input}
+                  placeholder="Nombre del hábito"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  autoFocus
+                />
+
+                <div style={styles.fieldLabel}>¿Buen hábito o mal hábito?</div>
+                <div style={styles.typeToggle}>
+                  <button
+                    type="button"
+                    style={{ ...styles.typePill, ...(newKind === "good" ? styles.typePillActiveGood : {}) }}
+                    onClick={() => setNewKind("good")}
+                  >
+                    ✅ Buen hábito
+                  </button>
+                  <button
+                    type="button"
+                    style={{ ...styles.typePill, ...(newKind === "bad" ? styles.typePillActiveBad : {}) }}
+                    onClick={() => setNewKind("bad")}
+                  >
+                    ⚠️ Mal hábito
+                  </button>
+                </div>
+
+                <div style={styles.fieldLabel}>¿Cuándo se completa?</div>
+                <div style={styles.typeToggle}>
+                  <button
+                    type="button"
+                    style={{ ...styles.typePill, ...(newType === "instant" ? styles.typePillActive : {}) }}
+                    onClick={() => setNewType("instant")}
+                  >
+                    ⚡ Instantáneo
+                  </button>
+                  <button
+                    type="button"
+                    style={{ ...styles.typePill, ...(newType === "daily" ? styles.typePillActive : {}) }}
+                    onClick={() => setNewType("daily")}
+                  >
+                    🌙 Final del día
+                  </button>
+                </div>
+
+                {newKind === "good" && (
+                  <>
+                    <div style={styles.fieldLabel}>Área de vida a la que suma XP</div>
+                    <select
+                      style={styles.select}
+                      value={newCategory}
+                      onChange={(e) => setNewCategory(e.target.value)}
+                    >
+                      {CATEGORIES.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.icon} {c.name}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
+
+                <div style={styles.addFormRow}>
+                  {newKind === "good" && (
+                    <label style={styles.pointsLabel}>
+                      Puntos XP
+                      <input
+                        type="number"
+                        min={0}
+                        max={999}
+                        style={styles.inputPoints}
+                        value={newPoints}
+                        onChange={(e) => setNewPoints(e.target.value)}
+                      />
+                    </label>
+                  )}
+                  <label style={styles.pointsLabel}>
+                    {newKind === "bad" ? "Vida que resta" : "Vida que suma"}
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      style={styles.inputPoints}
+                      value={newHpImpact}
+                      onChange={(e) => setNewHpImpact(e.target.value)}
+                    />
+                  </label>
+                </div>
+
+                <div style={styles.addFormActions}>
+                  <button style={styles.cancelBtn} onClick={() => { setShowAdd(false); setError(""); }}>
+                    Cancelar
+                  </button>
+                  <button style={styles.confirmBtn} onClick={addHabit}>
+                    Añadir
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {page === "categories" && (
+          <div style={styles.categoriesWrap}>
+            {CATEGORIES.map((cat) => {
+              const xp = categoryXP(cat.id);
+              const { level: catLevel, into, need } = levelInfo(xp);
+              const pct = need > 0 ? into / need : 0;
+              const filled = Math.floor(pct * 10);
+              return (
+                <div key={cat.id} style={styles.categoryRow}>
+                  <div style={styles.categoryNameWrap}>
+                    <span style={styles.categoryIcon}>{cat.icon}</span>
+                    <span style={styles.categoryName}>{cat.name}</span>
+                  </div>
+                  <div style={styles.categoryBarWrap}>
+                    <div style={styles.categorySegments}>
+                      {Array.from({ length: 10 }).map((_, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            ...styles.categorySegment,
+                            ...(i < filled ? styles.categorySegmentFilled : {}),
+                            ...(i === filled ? styles.categorySegmentPartial : {}),
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <div style={styles.categoryLabel}>
+                      <span style={styles.mono}>{into} / {need}</span> Nivel {catLevel}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Backup / restore */}
+        <div style={styles.backupWrap}>
+          <div style={styles.backupTitle}>⚙️ Copia de seguridad</div>
+          <div style={styles.backupText}>
+            Tu progreso ya se guarda automáticamente. Aun así, puedes descargar una copia por si
+            algún día cambias de app o de dispositivo.
+          </div>
+          <div style={styles.backupActions}>
+            <button style={styles.backupBtn} onClick={exportData}>
+              ⬇️ Exportar copia
+            </button>
+            <button style={styles.backupBtn} onClick={triggerImport}>
+              ⬆️ Importar copia
+            </button>
+          </div>
+          {importMsg && <div style={styles.backupMsg}>{importMsg}</div>}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json"
+            style={{ display: "none" }}
+            onChange={handleImportFile}
+          />
+        </div>
+      </div>
+
+      {/* Drag ghost */}
+      {dragging && draggedHabit && (
+        <div style={{ ...styles.ghost, left: dragging.x, top: dragging.y }}>
+          <span>{draggedHabit.type === "instant" ? "⚡" : "🌙"}</span>
+          <span>{draggedHabit.name}</span>
+          <span style={styles.ghostPts}>+{draggedHabit.points}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Section({
+  title,
+  icon,
+  hint,
+  sectionType,
+  habits,
+  todaysCompletions,
+  dragging,
+  onToggle,
+  onRemove,
+  onCardPointerDown,
+  justStamped,
+}) {
+  const isDropTarget =
+    dragging && dragging.hoverType === sectionType && dragging.originType !== sectionType;
+  const doneCount = habits.filter((h) => todaysCompletions[h.id]).length;
+
+  return (
+    <div
+      data-section-type={sectionType}
+      style={{ ...styles.sectionWrap, ...(isDropTarget ? styles.sectionWrapActive : {}) }}
+    >
+      <div style={styles.sectionHeader}>
+        <div>
+          <span style={styles.sectionIcon}>{icon}</span>
+          <span style={styles.sectionTitle}>{title}</span>
+        </div>
+        <span style={styles.sectionCount}>
+          {doneCount}/{habits.length}
+        </span>
+      </div>
+      <div style={styles.sectionSub}>{hint}</div>
+
+      <div style={styles.questList}>
+        {habits.length === 0 && (
+          <div style={styles.emptyState}>
+            Arrastra aquí una misión, o crea una nueva en esta categoría.
+          </div>
+        )}
+        {habits.map((h) => {
+          const done = !!todaysCompletions[h.id];
+          const stamping = justStamped === h.id;
+          const isBeingDragged = dragging && dragging.habitId === h.id;
+          const isBad = h.kind === "bad";
+          return (
+            <div
+              key={h.id}
+              onPointerDown={(e) => onCardPointerDown(e, h)}
+              style={{
+                ...styles.questCard,
+                ...(done ? (isBad ? styles.questCardDoneBad : styles.questCardDone) : {}),
+                ...(isBeingDragged ? styles.questCardLifted : {}),
+              }}
+            >
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => onToggle(h.id)}
+                style={{
+                  ...styles.seal,
+                  ...(isBad ? styles.sealBad : {}),
+                  ...(done ? (isBad ? styles.sealDoneBad : styles.sealDone) : {}),
+                  ...(stamping ? styles.sealStamp : {}),
+                }}
+                aria-pressed={done}
+                aria-label={done ? `Marcar "${h.name}" como pendiente` : `Completar "${h.name}"`}
+              >
+                {done ? "✓" : ""}
+              </button>
+              <div style={styles.questBody}>
+                <div style={{ ...styles.questName, ...(done ? styles.questNameDone : {}) }}>
+                  {h.name}
+                </div>
+                <div style={{ ...styles.questPoints, ...(isBad ? styles.questPointsBad : {}) }}>
+                  {isBad ? (
+                    <span style={styles.mono}>-{h.hpImpact} vida</span>
+                  ) : (
+                    <>
+                      <span style={styles.mono}>+{h.points} XP</span>
+                      <span style={styles.mono}> · +{h.hpImpact} vida</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => onRemove(h.id)}
+                style={styles.deleteBtn}
+                aria-label={`Eliminar misión "${h.name}"`}
+                title="Eliminar misión"
+              >
+                ✕
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function FontsAndKeyframes() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap');
+      @keyframes stampDown {
+        0% { transform: scale(1) rotate(0deg); }
+        40% { transform: scale(1.35) rotate(-8deg); }
+        70% { transform: scale(0.92) rotate(3deg); }
+        100% { transform: scale(1) rotate(0deg); }
+      }
+      @keyframes fillSweep {
+        0% { filter: brightness(1); }
+        50% { filter: brightness(1.4); }
+        100% { filter: brightness(1); }
+      }
+      @keyframes pulseRune {
+        0%, 100% { opacity: 0.5; transform: scale(1); }
+        50% { opacity: 1; transform: scale(1.15); }
+      }
+    `}</style>
+  );
+}
+
+// ---------- styles ----------
+const COLORS = {
+  bg: "#12141A",
+  surface: "#1B1E26",
+  surfaceRaised: "#232734",
+  border: "rgba(255,255,255,0.08)",
+  gold: "#E3B23C",
+  goldSoft: "rgba(227,178,60,0.15)",
+  emerald: "#3FBF8F",
+  emeraldSoft: "rgba(63,191,143,0.15)",
+  rose: "#E8607A",
+  roseSoft: "rgba(232,96,122,0.15)",
+  text: "#EDEAE3",
+  muted: "#8B8F9B",
+};
+
+const styles = {
+  page: {
+    minHeight: "100vh",
+    background: `radial-gradient(circle at 50% 0%, #1A1D26 0%, ${COLORS.bg} 55%)`,
+    display: "flex",
+    justifyContent: "center",
+    padding: "28px 16px 60px",
+    fontFamily: "'Inter', sans-serif",
+    color: COLORS.text,
+  },
+  loadingWrap: {
+    minHeight: "100vh",
+    background: COLORS.bg,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  loadingRune: { color: COLORS.gold, fontSize: 28, animation: "pulseRune 1.2s ease-in-out infinite" },
+  container: { width: "100%", maxWidth: 460 },
+  header: {
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 16,
+    padding: "20px 20px 16px",
+    marginBottom: 14,
+  },
+  headerTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 },
+  eyebrow: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.14em", color: COLORS.gold, marginBottom: 4 },
+  title: { fontFamily: "'Cinzel', serif", fontSize: 22, fontWeight: 700, margin: 0, color: COLORS.text, lineHeight: 1.25 },
+  levelBadge: {
+    width: 56,
+    height: 56,
+    borderRadius: "50%",
+    background: `conic-gradient(${COLORS.gold} 0deg, ${COLORS.goldSoft} 0deg)`,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    border: `2px solid ${COLORS.gold}`,
+  },
+  levelBadgeInner: {
+    width: 46,
+    height: 46,
+    borderRadius: "50%",
+    background: COLORS.surface,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  levelNum: { fontFamily: "'Cinzel', serif", fontSize: 18, fontWeight: 700, color: COLORS.gold, lineHeight: 1 },
+  levelLabel: { fontFamily: "'JetBrains Mono', monospace", fontSize: 8, letterSpacing: "0.08em", color: COLORS.muted, marginTop: 2 },
+  xpBarOuter: { position: "relative", height: 14, borderRadius: 7, background: "#0E1015", border: `1px solid ${COLORS.border}`, overflow: "hidden" },
+  xpBarFill: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    bottom: 0,
+    background: `linear-gradient(90deg, ${COLORS.emerald}, ${COLORS.gold})`,
+    borderRadius: 7,
+    transition: "width 0.5s ease",
+    animation: "fillSweep 2.5s ease-in-out infinite",
+  },
+  xpBarNotches: { position: "absolute", inset: 0, display: "flex" },
+  notch: { flex: 1, borderRight: "1px solid rgba(0,0,0,0.35)" },
+  xpBarCaption: { display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 11, color: COLORS.muted },
+  mono: { fontFamily: "'JetBrains Mono', monospace" },
+  hpRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 14 },
+  hpIcon: { color: COLORS.rose, fontSize: 14, flexShrink: 0 },
+  hpBarOuter: { flex: 1, height: 12, borderRadius: 6, background: "#0E1015", border: `1px solid ${COLORS.border}`, overflow: "hidden" },
+  hpBarFill: { height: "100%", borderRadius: 6, transition: "width 0.4s ease" },
+  hpText: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: COLORS.muted, flexShrink: 0 },
+  hpBanner: {
+    background: "linear-gradient(135deg, rgba(232,96,122,0.15), #1B1E26)",
+    border: `1px solid ${COLORS.rose}`,
+    borderRadius: 14,
+    padding: "16px 18px",
+    marginBottom: 14,
+    textAlign: "center",
+  },
+  hpBannerTitle: { fontFamily: "'Cinzel', serif", fontSize: 16, fontWeight: 700, color: COLORS.rose, marginBottom: 6 },
+  hpBannerText: { fontSize: 12, color: COLORS.text, marginBottom: 12, lineHeight: 1.5 },
+  hpBannerBtn: {
+    background: COLORS.rose,
+    border: "none",
+    color: "#12141A",
+    borderRadius: 8,
+    padding: "10px 18px",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  tabs: { display: "flex", gap: 8, marginBottom: 14 },
+  tab: {
+    flex: 1,
+    padding: "10px 8px",
+    borderRadius: 10,
+    border: `1px solid ${COLORS.border}`,
+    background: COLORS.surface,
+    color: COLORS.muted,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+    fontFamily: "'Inter', sans-serif",
+  },
+  tabActive: { borderColor: COLORS.gold, color: COLORS.gold, background: COLORS.goldSoft },
+  todayCard: {
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 14,
+    padding: "14px 18px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  todayCardDone: { borderColor: COLORS.emerald, background: `linear-gradient(135deg, ${COLORS.emeraldSoft}, ${COLORS.surface})` },
+  todayLabel: { fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: "0.12em", color: COLORS.muted, marginBottom: 2 },
+  todayValue: { fontFamily: "'Cinzel', serif", fontSize: 20, fontWeight: 700, color: COLORS.text },
+  todayOf: { fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 500, color: COLORS.muted },
+  doneBanner: { fontFamily: "'Cinzel', serif", fontSize: 12, color: COLORS.emerald, fontWeight: 700 },
+  errorBox: {
+    background: "rgba(232,96,122,0.12)",
+    border: `1px solid ${COLORS.rose}`,
+    color: COLORS.rose,
+    borderRadius: 10,
+    padding: "10px 14px",
+    fontSize: 13,
+    marginBottom: 14,
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 10,
+  },
+  errorDismiss: { background: "none", border: "none", color: COLORS.rose, cursor: "pointer", fontSize: 13 },
+  dragHint: { fontSize: 11, color: COLORS.muted, textAlign: "center", marginBottom: 12, fontStyle: "italic" },
+  sectionWrap: {
+    borderRadius: 16,
+    border: `1px solid ${COLORS.border}`,
+    padding: "14px 14px 6px",
+    marginBottom: 14,
+    transition: "border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease",
+  },
+  sectionWrapActive: { borderColor: COLORS.gold, boxShadow: `0 0 0 3px ${COLORS.goldSoft}`, background: "rgba(227,178,60,0.05)" },
+  sectionHeader: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  sectionIcon: { marginRight: 8, fontSize: 14 },
+  sectionTitle: { fontFamily: "'Cinzel', serif", fontSize: 15, fontWeight: 700, color: COLORS.text },
+  sectionCount: { fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: COLORS.muted },
+  sectionSub: { fontSize: 11, color: COLORS.muted, marginTop: 2, marginBottom: 12 },
+  questList: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 8 },
+  emptyState: {
+    textAlign: "center",
+    color: COLORS.muted,
+    fontSize: 12,
+    padding: "18px 12px",
+    border: `1px dashed ${COLORS.border}`,
+    borderRadius: 12,
+  },
+  questCard: {
+    display: "flex",
+    alignItems: "center",
+    gap: 14,
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 14,
+    padding: "12px 14px",
+    transition: "background 0.3s ease, border-color 0.3s ease, opacity 0.2s ease",
+    cursor: "grab",
+    touchAction: "none",
+    userSelect: "none",
+  },
+  questCardDone: { background: COLORS.surfaceRaised, borderColor: "rgba(63,191,143,0.35)" },
+  questCardDoneBad: { background: COLORS.surfaceRaised, borderColor: "rgba(232,96,122,0.35)" },
+  questCardLifted: { opacity: 0.35, borderStyle: "dashed" },
+  seal: {
+    width: 40,
+    height: 40,
+    borderRadius: "50%",
+    border: `2px solid ${COLORS.gold}`,
+    background: "transparent",
+    color: COLORS.gold,
+    fontSize: 18,
+    fontWeight: 700,
+    cursor: "pointer",
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    transition: "background 0.25s ease, color 0.25s ease, transform 0.25s ease",
+    touchAction: "auto",
+  },
+  sealBad: { borderColor: COLORS.rose, color: COLORS.rose },
+  sealDone: { background: COLORS.emerald, borderColor: COLORS.emerald, color: "#0E1015" },
+  sealDoneBad: { background: COLORS.rose, borderColor: COLORS.rose, color: "#0E1015" },
+  sealStamp: { animation: "stampDown 0.5s ease" },
+  questBody: { flex: 1, minWidth: 0 },
+  questName: { fontSize: 15, fontWeight: 600, color: COLORS.text, marginBottom: 2 },
+  questNameDone: { color: COLORS.muted, textDecoration: "line-through" },
+  questPoints: { fontSize: 12, color: COLORS.gold },
+  questPointsBad: { color: COLORS.rose },
+  deleteBtn: { background: "none", border: "none", color: COLORS.muted, cursor: "pointer", fontSize: 13, padding: 6, flexShrink: 0, touchAction: "auto" },
+  addBtn: {
+    width: "100%",
+    padding: "13px",
+    borderRadius: 12,
+    border: `1px dashed ${COLORS.gold}`,
+    background: "transparent",
+    color: COLORS.gold,
+    fontFamily: "'Cinzel', serif",
+    fontWeight: 700,
+    fontSize: 14,
+    cursor: "pointer",
+    letterSpacing: "0.02em",
+  },
+  addForm: { background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 14, padding: 16 },
+  addFormTitle: { fontFamily: "'Cinzel', serif", fontSize: 15, fontWeight: 700, marginBottom: 10, color: COLORS.text },
+  fieldLabel: { fontSize: 11, color: COLORS.muted, marginBottom: 6, marginTop: 10 },
+  input: {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "#0E1015",
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 8,
+    padding: "10px 12px",
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: "'Inter', sans-serif",
+  },
+  select: {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "#0E1015",
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 8,
+    padding: "10px 12px",
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: "'Inter', sans-serif",
+  },
+  typeToggle: { display: "flex", gap: 8, marginBottom: 4 },
+  typePill: {
+    flex: 1,
+    padding: "9px 8px",
+    borderRadius: 8,
+    border: `1px solid ${COLORS.border}`,
+    background: "#0E1015",
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: "'Inter', sans-serif",
+    cursor: "pointer",
+  },
+  typePillActive: { borderColor: COLORS.gold, color: COLORS.gold, background: COLORS.goldSoft },
+  typePillActiveGood: { borderColor: COLORS.emerald, color: COLORS.emerald, background: COLORS.emeraldSoft },
+  typePillActiveBad: { borderColor: COLORS.rose, color: COLORS.rose, background: COLORS.roseSoft },
+  addFormRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10, marginTop: 12 },
+  pointsLabel: { fontSize: 11, color: COLORS.muted, display: "flex", flexDirection: "column", gap: 4, flex: 1 },
+  inputPoints: {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "#0E1015",
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 8,
+    padding: "8px 10px",
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  addFormActions: { display: "flex", gap: 8, marginTop: 14 },
+  cancelBtn: { flex: 1, background: "none", border: `1px solid ${COLORS.border}`, color: COLORS.muted, borderRadius: 8, padding: "9px 14px", fontSize: 13, cursor: "pointer" },
+  confirmBtn: { flex: 1, background: COLORS.gold, border: "none", color: "#12141A", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  ghost: {
+    position: "fixed",
+    transform: "translate(-50%, -50%) rotate(-3deg)",
+    pointerEvents: "none",
+    zIndex: 999,
+    background: COLORS.surfaceRaised,
+    border: `2px solid ${COLORS.gold}`,
+    borderRadius: 12,
+    padding: "10px 16px",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 14,
+    fontWeight: 600,
+    color: COLORS.text,
+    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+  },
+  ghostPts: { fontFamily: "'JetBrains Mono', monospace", color: COLORS.gold, fontSize: 12 },
+  categoriesWrap: {
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 16,
+    padding: "16px 16px",
+    display: "flex",
+    flexDirection: "column",
+    gap: 16,
+  },
+  categoryRow: { display: "flex", flexDirection: "column", gap: 6 },
+  categoryNameWrap: { display: "flex", alignItems: "center", gap: 8 },
+  categoryIcon: { fontSize: 14 },
+  categoryName: { fontSize: 13, fontWeight: 600, color: COLORS.text },
+  categoryBarWrap: { display: "flex", alignItems: "center", gap: 10 },
+  categorySegments: { display: "flex", gap: 2, flex: 1 },
+  categorySegment: { flex: 1, height: 14, borderRadius: 3, background: "#0E1015", border: `1px solid ${COLORS.border}` },
+  categorySegmentFilled: { background: COLORS.emerald, borderColor: COLORS.emerald },
+  categorySegmentPartial: { background: `repeating-linear-gradient(45deg, ${COLORS.gold}, ${COLORS.gold} 3px, #0E1015 3px, #0E1015 6px)`, borderColor: COLORS.gold },
+  categoryLabel: { fontSize: 10, color: COLORS.muted, whiteSpace: "nowrap", flexShrink: 0 },
+  backupWrap: {
+    marginTop: 18,
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 14,
+    padding: "14px 16px",
+  },
+  backupTitle: { fontFamily: "'Cinzel', serif", fontSize: 13, fontWeight: 700, color: COLORS.text, marginBottom: 6 },
+  backupText: { fontSize: 11, color: COLORS.muted, lineHeight: 1.5, marginBottom: 12 },
+  backupActions: { display: "flex", gap: 8 },
+  backupBtn: {
+    flex: 1,
+    background: "#0E1015",
+    border: `1px solid ${COLORS.border}`,
+    color: COLORS.text,
+    borderRadius: 8,
+    padding: "9px 8px",
+    fontSize: 12,
+    cursor: "pointer",
+    fontFamily: "'Inter', sans-serif",
+  },
+  backupMsg: { fontSize: 11, color: COLORS.emerald, marginTop: 10, textAlign: "center" },
+};
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<HabitQuest />);
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
